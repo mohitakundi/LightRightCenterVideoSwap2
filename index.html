@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Gaze Video</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- TensorFlow.js and COCO-SSD model -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.11.0/dist/tf.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+        }
+        /* Custom styles for loading animation */
+        .loader {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 2s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body class="bg-gray-900 text-white flex flex-col items-center justify-center min-h-screen p-4">
+
+    <div class="w-full max-w-3xl mx-auto text-center">
+        <h1 class="text-3xl md:text-4xl font-bold mb-2">Interactive Gaze</h1>
+        <p class="text-gray-400 mb-6">Move left, right, or stay in the center. The person in the video will follow you.</p>
+
+        <div class="bg-black rounded-lg shadow-2xl overflow-hidden aspect-video relative">
+            <!-- The main video that will be controlled -->
+            <video id="displayVideo" class="w-full h-full object-cover" loop muted playsinline>
+                 <!-- Using the user-provided video -->
+                 <source src="LeftRightCenterVideo.mp4" type="video/mp4">
+                 Your browser does not support the video tag.
+            </video>
+            <!-- Overlay to show status messages -->
+            <div id="statusOverlay" class="absolute inset-0 bg-black bg-opacity-75 flex flex-col items-center justify-center transition-opacity duration-500">
+                <div id="loader" class="loader"></div>
+                <p id="status" class="mt-4 text-lg">Initializing...</p>
+            </div>
+        </div>
+        
+        <div class="mt-4 p-3 bg-gray-800 rounded-lg">
+            <p class="text-lg font-semibold">Detected Position: <span id="position" class="text-xl font-bold text-blue-400">---</span></p>
+        </div>
+    </div>
+
+    <!-- Hidden video element for webcam feed -->
+    <video id="webcamFeed" autoplay muted playsinline class="absolute opacity-0 -z-10 w-64 h-48"></video>
+
+    <script>
+        const displayVideo = document.getElementById('displayVideo');
+        const webcamFeed = document.getElementById('webcamFeed');
+        const statusEl = document.getElementById('status');
+        const statusOverlay = document.getElementById('statusOverlay');
+        const loader = document.getElementById('loader');
+        const positionEl = document.getElementById('position');
+
+        // Define the time points (in seconds) in the video for each gaze direction.
+        const FRAME_TIMES = {
+            LEFT: 50,   // Time in video when person is looking left
+            CENTER: 32, // Time in video when person is looking center
+            RIGHT: 10    // Time in video when person is looking right
+        };
+
+        let model = null;
+        
+        // --- Animation variables ---
+        let targetTime = FRAME_TIMES.CENTER; 
+        let animationFrameId = null;
+
+        // --- Smoothing/Debouncing Variables ---
+        // The number of consecutive frames a position must be detected before it's confirmed.
+        const CONFIRMATION_FRAMES = 3; 
+        // The last position that was detected in the previous frame.
+        let lastDetectedPosition = 'CENTER'; 
+        // The current stable position after smoothing.
+        let stablePosition = 'CENTER';
+        // A counter for how many consecutive frames the current position has been detected.
+        let positionCounter = 0;
+
+
+        async function main() {
+            statusEl.textContent = 'Loading AI model...';
+            try {
+                // Load the COCO-SSD model for object detection
+                model = await cocoSsd.load();
+                statusEl.textContent = 'Please allow camera access.';
+                startWebcam();
+            } catch (err) {
+                console.error("Error loading model:", err);
+                statusEl.textContent = 'Failed to load AI model.';
+                loader.style.display = 'none';
+            }
+        }
+
+        async function startWebcam() {
+            try {
+                // Request access to the user's webcam
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'user'
+                    },
+                    audio: false
+                });
+                webcamFeed.srcObject = stream;
+                
+                // Wait for the video to load before starting predictions
+                webcamFeed.onloadedmetadata = () => {
+                    statusEl.textContent = 'Camera ready. Starting detection...';
+                    // Pause the main video initially and set it to the center position.
+                    displayVideo.pause();
+                    displayVideo.currentTime = FRAME_TIMES.CENTER;
+                    
+                    // --- FIX: Set initial position text to prevent a blank display ---
+                    positionEl.textContent = 'CENTER';
+
+
+                    // Hide the overlay and start the detection loop
+                    setTimeout(() => {
+                       statusOverlay.style.opacity = '0';
+                       statusOverlay.style.pointerEvents = 'none';
+                       detectPersonLoop();
+                    }, 2000);
+                };
+            } catch (err) {
+                console.error("Error accessing webcam:", err);
+                statusEl.textContent = 'Camera access denied or unavailable.';
+                loader.style.display = 'none';
+            }
+        }
+        
+        async function detectPersonLoop() {
+            try {
+                // Detect objects in the webcam feed
+                const predictions = await model.detect(webcamFeed);
+                const personPrediction = predictions.find(p => p.class === 'person' && p.score > 0.6);
+
+                let currentPosition = 'CENTER'; // Default to center
+
+                if (personPrediction) {
+                    const bbox = personPrediction.bbox;
+                    const personCenterX = bbox[0] + bbox[2] / 2;
+                    const videoWidth = webcamFeed.videoWidth;
+
+                    // --- ADJUSTED ZONES: The center zone is now narrower to reduce bias ---
+                    const leftBoundary = videoWidth * 0.4; // Was videoWidth / 3
+                    const rightBoundary = videoWidth * 0.6; // Was videoWidth * (2 / 3)
+
+                    if (personCenterX < leftBoundary) {
+                        currentPosition = 'RIGHT'; 
+                    } else if (personCenterX > rightBoundary) {
+                        currentPosition = 'LEFT';
+                    } else {
+                        currentPosition = 'CENTER';
+                    }
+                }
+                
+                // --- SMOOTHING LOGIC: Prevents flickering ---
+                // Check if the detected position is the same as the last frame.
+                if (currentPosition === lastDetectedPosition) {
+                    positionCounter++; // If yes, increment the counter.
+                } else {
+                    // If the position has changed, reset the counter and update the last detected position.
+                    lastDetectedPosition = currentPosition;
+                    positionCounter = 0;
+                }
+
+                // Only update the stable position if the new position has been detected
+                // for the required number of confirmation frames.
+                if (positionCounter >= CONFIRMATION_FRAMES && stablePosition !== currentPosition) {
+                    stablePosition = currentPosition;
+                    // Trigger the animation to move to the new stable position.
+                    setTargetPosition(stablePosition);
+                }
+
+
+            } catch(err) {
+                console.error("Prediction error:", err);
+            }
+
+            // Continuously run the detection loop.
+            requestAnimationFrame(detectPersonLoop);
+        }
+
+        /**
+         * Sets the target position for the video gaze and starts the animation.
+         * @param {string} position - The new target position ('LEFT', 'CENTER', or 'RIGHT').
+         */
+        function setTargetPosition(position) {
+            positionEl.textContent = position;
+            let newTargetTime;
+
+            // Determine the new target time from our FRAME_TIMES constant.
+            switch (position) {
+                case 'LEFT':
+                    newTargetTime = FRAME_TIMES.LEFT;
+                    break;
+                case 'RIGHT':
+                    newTargetTime = FRAME_TIMES.RIGHT;
+                    break;
+                case 'CENTER':
+                default:
+                    newTargetTime = FRAME_TIMES.CENTER;
+                    break;
+            }
+
+            // Only start a new animation if the target time has actually changed.
+            if (Math.abs(newTargetTime - targetTime) > 0.1) {
+                targetTime = newTargetTime;
+                
+                // If an animation is already running, cancel it to start a new one.
+                if (animationFrameId) {
+                    cancelAnimationFrame(animationFrameId);
+                }
+                
+                // Start the new animation loop.
+                animationFrameId = requestAnimationFrame(animateVideo);
+            }
+        }
+
+        /**
+         * The core animation loop. This function is called repeatedly to
+         * smoothly adjust the video's currentTime until it reaches the targetTime.
+         */
+        function animateVideo() {
+            // Calculate the difference between where we are and where we want to be.
+            const diff = targetTime - displayVideo.currentTime;
+            // Stop when we are very close to the target to prevent jitter.
+            const threshold = 0.05; 
+
+            if (Math.abs(diff) < threshold) {
+                displayVideo.currentTime = targetTime; // Snap to the final position.
+                cancelAnimationFrame(animationFrameId);
+                animationFrameId = null;
+                return; // Stop the loop
+            }
+
+            // --- CONSTANT SPEED SCRUBBING ---
+            // This value determines how many seconds the video moves per animation frame.
+            // A smaller value creates a smoother, slower scrub. This gives a nice fluid motion.
+            const scrubSpeed = 2;
+            
+            // Move forward or backward at a constant speed.
+            if (diff > 0) {
+                displayVideo.currentTime += scrubSpeed;
+            } else {
+                displayVideo.currentTime -= scrubSpeed;
+            }
+
+            // Request the next frame to continue the animation.
+            animationFrameId = requestAnimationFrame(animateVideo);
+        }
+
+        // Start the application when the window loads
+        window.onload = main;
+    </script>
+</body>
+</html>
+
